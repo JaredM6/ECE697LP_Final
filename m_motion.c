@@ -47,6 +47,8 @@
 #include "macros_common.h"
 #include "math.h"
 #include "m_ui.h"
+#include <time.h>
+#include <unistd.h>
 
 
 #define RAW_PARAM_NUM                 9     // Number of raw parameters (3 * acc + 3 * gyro + 3 * compass).
@@ -57,6 +59,7 @@
 static ble_tms_t              m_tms;
 static ble_tms_config_t     * m_config;
 static const ble_tms_config_t m_default_config = MOTION_DEFAULT_CONFIG;
+uint32_t ans;
 
 //*****************Your Values from Tutorial 1 here**********************
 
@@ -77,6 +80,11 @@ uint8_t acc_index = 0;
 bool sign_state_pos = false;
 
 uint32_t step_count = 0;
+uint32_t drink_count = 0;       // Counts the drinks, hijacks the pedometer step counter
+bool bottle_empty = false;      // Is the bottle "empty" (titled past a high enough z acceleration)
+bool bottle_lowered = false;   // Is the bottle "being lowered" (coming from empty, for robust lighting)
+
+bool drink_taken = true;        // Check for not spamming drinks
 
 bool new_step = false;
 
@@ -335,6 +343,7 @@ static void drv_motion_evt_handler(drv_motion_evt_t const * p_evt, void * p_data
             APP_ERROR_CHECK_BOOL(size == sizeof(int32_t) * RAW_PARAM_NUM);
 
             ble_tms_raw_t data;
+            
             int32_t     * p_raw = (int32_t *)p_data;
 
             double x_buf;
@@ -352,6 +361,7 @@ static void drv_motion_evt_handler(drv_motion_evt_t const * p_evt, void * p_data
 
             z_buf = (double)p_raw[2];
             z_buf = z_buf/(1<<16);
+            
 
             //format as string for debugging purposes and print accelerometer values to segger RTT console channel 1
             // sprintf(buffer, "ACCEL_DATA %.2f,%.2f,%.2f", x_buf,y_buf,z_buf);
@@ -605,10 +615,8 @@ uint32_t process_accel_data(double x, double y, double z)
 {
     double mean_acc = 0;
     double normalized_accel = 0;
-    //int drink_buffer = 50;
-    //double z_sum = 0;
-    //int z_avg = 0;
-    //int prev_z = 0;
+
+    ble_tms_pedo_t data_drink;      // Same struct as step counter data
 
     char buffer[24];
 
@@ -638,40 +646,82 @@ uint32_t process_accel_data(double x, double y, double z)
     //NRF_LOG_INFO(" %s\r\n", buffer);
 
     prev_ewma = normalized_accel;
+
+
+
+   /* Drink control code */
+
+
+
+
+    time_t start_time, end_time;
+    time(&start_time);      //test time variable
+    double average=0.7;     //here we have to determine the longest time it takes during tilting
+    
     /*
-    sprintf(buffer, "X %.2f", x);
-    NRF_LOG_INFO(" %s\r\n", buffer);
-    sprintf(buffer, "Y %.2f", y);
-    NRF_LOG_INFO(" %s\r\n", buffer);
-    sprintf(buffer, "Z %.2f", z);
-    NRF_LOG_INFO(" %s\r\n", buffer);
-    
-    //Usually either negative values and very small (~1, maybe 2)
-    //need to make absolute values, increase by 100 so its visible
-    
-    x = 100*abs(x);
-    y = 100*abs(y);
-    z = 100*abs(z);
-    m_ui_led_constant_set(x,y,z);
+    Water bottle is stationary. 
+        - Assumes not empty 
+        - Assumes not being lowered down to stationary from empty. 
     */
+    if((z <= -0.65) && (bottle_empty == false) && (bottle_lowered == false))
+    {
+        time(&end_time);
+        
+        if((difftime(end_time,start_time) >= 1))  // Difftime, how long the bottle is being tipped. Ignore user swinging bottle around.
+        {
+            ans = m_ui_led_constant_set(0,0,50);  //blue light goes up
+        }
+        drink_taken = false;
+    }
+    /*
+    Drinking check. If the water bottle is tilted (not too far) turn green and count. 
+        - Assumes not empty 
+        - Assumes not being lowered down to stationary from empty (especially relevant for this check). 
+    */
+    else if((z >- 0.65) && (z < 0.5) && (bottle_empty == false) && (bottle_lowered == false))
+    {
+        time(&end_time);
 
-    // Have led respond to orientation (assumes x,y, or z never equal)
+        if((difftime(end_time,start_time) >= 1.5))  // Only count as a drink once held stationary for a short while
+        {
+            ans = m_ui_led_constant_set(0,50,0);    // Green light on
+            if(drink_taken == false)                // Only trigger count if first time in the drinking zone
+            {
+                drink_count++;          // Add a drink count
+                data_drink.time_ms = 0; 
+                data_drink.steps = drink_count;   // Add to drink struct
+                (void)ble_tms_pedo_set(&m_tms, &data_drink);   // Send to app
+                drink_taken = true;    // Change to true, no more counting for this drink check
+            }
+        }
+    }
+    /*
+    Bottle is empty or close to empty. Lock all colors until the user takes a small sip. 
+    */
+    else
+    {
+        bottle_empty = true;      // Assuming user empty bottle based off this angle, lock other drink checks
+        ans = m_ui_led_constant_set(50,0,0);    // Turn on red light
+    }
+    /*
+    Lowering check. Once empty, unlock other colors once drinking starts. Raises lowering state to keep red lighting robust. 
+        - Assumes bottle is empty
+        - Need this state check, otherwise the red light won't stay on during the lowering of the bottle
+    */
+    if((z<=-0.65) && (bottle_empty == true))        // Coming down from the last drink, stay red.
+    {
+        bottle_lowered = true;     // Lowering finished
+    }
+    /*
+    Refill check. Once empty, unlock other colors once drinking starts
+        - Assumes bottle is empty
+    */
+    if((z>-0.65) && (z<0.5) && (bottle_lowered==true) && (bottle_empty == true))    // Ready to become green upon drinking
+    {
+        bottle_empty =  false;
+        bottle_lowered = false;
+    }
     
-    if ((x > y) && (x > z))
-    {
-        m_ui_led_constant_set(100,0,0);
-    }
-    if ((y > x) && (y > z))
-    {
-        m_ui_led_constant_set(0,100,0);
-    }
-    if ((z > y) && (z > x))
-    {
-        m_ui_led_constant_set(0,0,100);
-    }
-
-    //for(int i = 0; i < drink_buffer; i++)
-    //  z_avg = z_avg + z;
 
     //now, check for a zero crossing (negative to positive) and update history
     if(normalized_accel > ACCEL_HYST)
@@ -681,17 +731,17 @@ uint32_t process_accel_data(double x, double y, double z)
       {
         sprintf(buffer, "STEP_DETECTED %i\r\n", step_count);
         NRF_LOG_INFO(" %s\r\n", buffer);
-        step_count++;
+        //step_count++;
         new_step = true;
 
-        ble_tms_pedo_t  data;
+        //ble_tms_pedo_t  data;
 
-        data.steps   = step_count;
-        data.time_ms = 0;
+        //data.steps   = step_count;
+        //data.time_ms = 0;
 
         NRF_LOG_INFO("Transmitting step");
 
-        (void)ble_tms_pedo_set(&m_tms, &data);
+        //(void)ble_tms_pedo_set(&m_tms, &data);
 
         //even, LED is on. Odd, turn it off. Useful for debugging when not tethered to the debugger.
         //if((step_count % 2) == 0)
